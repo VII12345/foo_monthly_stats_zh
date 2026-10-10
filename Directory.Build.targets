@@ -8,8 +8,9 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
 
   <PropertyGroup>
-    <_AtlMsvcVer Condition="'$(_AtlMsvcVer)'==''">14.50.35717</_AtlMsvcVer>
-    <_AtlRoot>C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\$(_AtlMsvcVer)\atlmfc</_AtlRoot>
+    <!-- Resolve ATL/MFC headers from the active Visual C++ toolset installation. -->
+    <_AtlRoot Condition="'$(VCToolsInstallDir)'!=''">$(VCToolsInstallDir)atlmfc</_AtlRoot>
+    <_AtlRoot Condition="'$(_AtlRoot)'=='' and '$(VCInstallDir)'!=''">$(VCInstallDir)atlmfc</_AtlRoot>
     <_WtlRoot>$(MSBuildThisFileDirectory)third_party\wtl\Include</_WtlRoot>
     
     <!-- Override PlatformToolset to v143 for GitHub Actions compatibility -->

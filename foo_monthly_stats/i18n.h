@@ -1,7 +1,6 @@
 #pragma once
 // i18n.h – lightweight internationalization helper
-// UI strings are embedded in the .rc file under two LANGUAGE blocks.
-// At runtime, GetUserDefaultUILanguage() selects Japanese or English.
+// Dialog resources are localized in the .rc file; generated UI and reports use tr().
 
 namespace fms
 {
@@ -11,6 +10,24 @@ namespace fms
     {
         LANGID lang = GetUserDefaultUILanguage();
         return PRIMARYLANGID(lang) == LANG_JAPANESE;
+    }
+
+    // Simplified-Chinese UI selection follows the Windows user interface language.
+    inline bool isChinese()
+    {
+        LANGID lang = GetUserDefaultUILanguage();
+        return PRIMARYLANGID(lang) == LANG_CHINESE && SUBLANGID(lang) == SUBLANG_CHINESE_SIMPLIFIED;
+    }
+
+    inline const char *tr(const char *english, const char *simplifiedChinese)
+    {
+        return isChinese() ? simplifiedChinese : english;
+    }
+
+    inline void setDialogTextUtf8(HWND hwnd, int controlId, const char *text)
+    {
+        const std::wstring wide = pfc::stringcvt::string_wide_from_utf8(text);
+        ::SetDlgItemTextW(hwnd, controlId, wide.c_str());
     }
 
     // String table IDs (must match values in .rc string tables)
@@ -42,7 +59,7 @@ namespace fms
     };
 
     // Load a string from the resource of the running DLL.
-    // Falls back to English if the Japanese string is not found.
+    // Uses Windows resource-language fallback when a localized string is unavailable.
     inline pfc::string8 LoadStr(StringId id)
     {
         HMODULE hMod = core_api::get_my_instance();

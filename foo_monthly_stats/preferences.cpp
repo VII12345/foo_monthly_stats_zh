@@ -2,6 +2,7 @@
 #include "preferences.h"
 #include "db_manager.h"
 #include "resource.h"
+#include "i18n.h"
 
 // ---------------------------------------------------------------------------
 // GUIDs – generated uniquely for foo_monthly_stats
@@ -161,7 +162,7 @@ namespace fms
             wchar_t buf[MAX_PATH] = {};
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = m_hWnd;
-            ofn.lpstrFilter = L"SQLite DB\0*.db\0All Files\0*.*\0";
+            ofn.lpstrFilter = fms::isChinese() ? L"SQLite 数据库\0*.db\0所有文件\0*.*\0" : L"SQLite DB\0*.db\0All Files\0*.*\0";
             ofn.lpstrFile = buf;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
@@ -176,7 +177,7 @@ namespace fms
             wchar_t buf[MAX_PATH] = {};
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = m_hWnd;
-            ofn.lpstrFilter = L"Executable\0*.exe\0All Files\0*.*\0";
+            ofn.lpstrFilter = fms::isChinese() ? L"可执行文件\0*.exe\0所有文件\0*.*\0" : L"Executable\0*.exe\0All Files\0*.*\0";
             ofn.lpstrFile = buf;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
@@ -218,7 +219,7 @@ namespace fms
     class FmsPreferencesPage : public preferences_page_impl<CPreferencesDlg>
     {
     public:
-        const char *get_name() override { return "Monthly Stats"; }
+        const char *get_name() override { return fms::tr("Monthly Stats", "月度统计"); }
         GUID get_guid() override { return guid_preferences_page; }
         GUID get_parent_guid() override { return preferences_page::guid_tools; }
     };

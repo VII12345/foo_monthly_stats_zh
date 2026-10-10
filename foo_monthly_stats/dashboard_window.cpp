@@ -63,7 +63,7 @@ namespace fms
     {
         m_viewMode = MONTH;
         m_period = DbManager::currentYM();
-        SetDlgItemTextA(m_hWnd, IDC_BTN_MODE_TOGGLE, "Month");
+        fms::setDialogTextUtf8(m_hWnd, IDC_BTN_MODE_TOGGLE, fms::tr("Month", "月"));
         SetupListColumns();
         UpdatePeriodLabel();
         UpdateExportFormatButton();
@@ -131,12 +131,12 @@ namespace fms
         // Update button text based on current mode
         const char *btnText;
         if (m_viewMode == MONTH)
-            btnText = "Month";
+            btnText = fms::tr("Month", "月");
         else if (m_viewMode == YEAR)
-            btnText = "Year";
+            btnText = fms::tr("Year", "年");
         else
-            btnText = "Day";
-        SetDlgItemTextA(m_hWnd, IDC_BTN_MODE_TOGGLE, btnText);
+            btnText = fms::tr("Day", "日");
+        fms::setDialogTextUtf8(m_hWnd, IDC_BTN_MODE_TOGGLE, btnText);
 
         UpdatePeriodLabel();
         SetupListColumns(); // Update column header (先月比 ↔ 昨日比 ↔ 前年比)
@@ -284,8 +284,8 @@ namespace fms
         HWND hBtn = GetDlgItem(IDC_BTN_EXPORT_FORMAT);
         if (hBtn)
         {
-            const char *btnText = m_exportFormatIsSmartphone ? "Export: Smartphone (1080x1980)" : "Export: Desktop";
-            SetDlgItemTextA(m_hWnd, IDC_BTN_EXPORT_FORMAT, btnText);
+            const char *btnText = m_exportFormatIsSmartphone ? fms::tr("Export: Smartphone (1080x1980)", "导出：手机长图 (1080×1980)") : fms::tr("Export: Desktop", "导出：桌面版");
+            fms::setDialogTextUtf8(m_hWnd, IDC_BTN_EXPORT_FORMAT, btnText);
         }
     }
 
@@ -297,8 +297,8 @@ namespace fms
 
         // Update status message
         const char *statusMsg = m_exportFormatIsSmartphone
-                                    ? "Smartphone (1080x1980px, Top 5/10)"
-                                    : "Desktop (full)";
+                                    ? fms::tr("Smartphone (1080x1980px, Top 5/10)", "手机长图（1080×1980，前 5/10 名）")
+                                    : fms::tr("Desktop (full)", "桌面版（完整）");
         SetStatus(statusMsg);
 
         // Schedule restoration of normal status display after 3 seconds
@@ -334,7 +334,7 @@ namespace fms
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = m_hWnd;
-        ofn.lpstrFilter = L"HTML File\0*.html\0";
+        ofn.lpstrFilter = fms::isChinese() ? L"HTML 文件\0*.html\0" : L"HTML File\0*.html\0";
         ofn.lpstrFile = htmlBuf;
         ofn.nMaxFile = MAX_PATH;
         ofn.lpstrDefExt = L"html";
@@ -348,7 +348,7 @@ namespace fms
         std::map<std::string, std::string> artMap = ReportExporter::collectArt(m_entries);
 
         // Generate HTML (Desktop or Smartphone format)
-        std::string periodLabel = m_viewMode == MONTH ? ("Monthly Stats – " + m_period) : ("Yearly Stats – " + m_period);
+        std::string periodLabel = m_viewMode == MONTH ? (std::string(fms::tr("Monthly Stats – ", "月度统计 – ")) + m_period) : (std::string(fms::tr("Yearly Stats – ", "年度统计 – ")) + m_period);
         std::string err = ReportExporter::exportHtml(periodLabel, m_entries, htmlPath, artMap, m_exportFormatIsSmartphone);
         if (!err.empty())
         {
@@ -379,9 +379,10 @@ namespace fms
         int minutes = static_cast<int>((totalSeconds - hours * 3600) / 60);
         int seconds = static_cast<int>(totalSeconds - hours * 3600 - minutes * 60);
 
-        std::string formatStr = m_exportFormatIsSmartphone ? " (Smartphone format)" : " (Desktop format)";
-        std::string exportMsg = "Export succeeded." + formatStr + " (" + std::to_string(m_entries.size()) +
-                                " tracks, " + std::to_string(hours) + "h " + std::to_string(minutes) + "m " + std::to_string(seconds) + "s)";
+        std::string formatStr = m_exportFormatIsSmartphone ? fms::tr(" (Smartphone format)", "（手机长图格式）") : fms::tr(" (Desktop format)", "（桌面格式）");
+        std::string exportMsg = fms::isChinese()
+                                    ? std::string("导出成功。") + formatStr + "（" + std::to_string(m_entries.size()) + " 首歌曲，共 " + std::to_string(hours) + "小时 " + std::to_string(minutes) + "分钟 " + std::to_string(seconds) + "秒）"
+                                    : std::string("Export succeeded.") + formatStr + " (" + std::to_string(m_entries.size()) + " tracks, " + std::to_string(hours) + "h " + std::to_string(minutes) + "m " + std::to_string(seconds) + "s)";
         SetStatus(exportMsg.c_str());
 
         // Schedule restoration of normal status display after 3 seconds
@@ -471,18 +472,18 @@ namespace fms
         // Adjust delta column label based on view mode
         const wchar_t *deltaLabel;
         if (m_viewMode == MONTH)
-            deltaLabel = L"先月比"; // Month-over-Month
+            deltaLabel = fms::isChinese() ? L"较上月" : L"先月比"; // Month-over-Month
         else if (m_viewMode == DAY)
-            deltaLabel = L"昨日比"; // Day-over-Day
+            deltaLabel = fms::isChinese() ? L"较昨日" : L"昨日比"; // Day-over-Day
         else                        // YEAR
-            deltaLabel = L"前年比"; // Year-over-Year
+            deltaLabel = fms::isChinese() ? L"较去年" : L"前年比"; // Year-over-Year
 
         const Col cols[] = {
             {L"#", 40},
-            {L"Title – Artist", 260},
-            {L"Artist", 120},
-            {L"Album", 120},
-            {L"Plays", 60},
+            {fms::isChinese() ? L"标题 – 艺术家" : L"Title – Artist", 260},
+            {fms::isChinese() ? L"艺术家" : L"Artist", 120},
+            {fms::isChinese() ? L"专辑" : L"Album", 120},
+            {fms::isChinese() ? L"播放次数" : L"Plays", 60},
             {deltaLabel, 60},
         };
         LVCOLUMNW lvc{};
@@ -548,8 +549,8 @@ namespace fms
         int minutes = static_cast<int>((totalSeconds - hours * 3600) / 60);
         int seconds = static_cast<int>(totalSeconds - hours * 3600 - minutes * 60);
 
-        std::string statusText = "Tracks: " + std::to_string(m_entries.size()) +
-                                 " | Total Listening Time: " + std::to_string(hours) + "h " + std::to_string(minutes) + "m " + std::to_string(seconds) + "s";
+        std::string statusText = fms::tr("Tracks: ", "歌曲数：") + std::to_string(m_entries.size()) +
+                                 fms::tr(" | Total Listening Time: ", " | 总播放时长：") + std::to_string(hours) + fms::tr("h ", "小时 ") + std::to_string(minutes) + fms::tr("m ", "分钟 ") + std::to_string(seconds) + fms::tr("s", "秒");
         SetStatus(statusText.c_str());
     }
 
@@ -560,7 +561,7 @@ namespace fms
 
     void DashboardWindow::SetStatus(const char *msg)
     {
-        SetDlgItemTextA(m_hWnd, IDC_STATIC_STATUS, msg);
+        fms::setDialogTextUtf8(m_hWnd, IDC_STATIC_STATUS, msg);
     }
 
     // ---------------------------------------------------------------------------
@@ -574,10 +575,10 @@ namespace fms
     public:
         t_uint32 get_command_count() override { return 1; }
         GUID get_command(t_uint32) override { return guid_cmd_open_stats; }
-        void get_name(t_uint32, pfc::string_base &out) override { out = "Monthly Stats..."; }
+        void get_name(t_uint32, pfc::string_base &out) override { out = fms::tr("Monthly Stats...", "月度统计..."); }
         bool get_description(t_uint32, pfc::string_base &out) override
         {
-            out = "Open the Monthly Stats dashboard window.";
+            out = fms::tr("Open the Monthly Stats dashboard window.", "打开月度统计面板。");
             return true;
         }
         bool get_display(t_uint32 idx, pfc::string_base &out, t_uint32 &flags) override

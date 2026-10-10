@@ -1,36 +1,61 @@
 #include "stdafx.h"
 #include "db_manager.h"
+#include "track_identity.h"
 
 namespace fms
 {
 
-    // -----------------------------------------------------------------------
-    // CRC64 – Jones polynomial (lightweight, no extra dependency)
-    // -----------------------------------------------------------------------
-    static uint64_t crc64(const char *data, size_t len)
+    static bool tableExists(sqlite3 *db, const char *table)
     {
-        static const uint64_t POLY = 0xad93d23594c935a9ULL;
-        uint64_t crc = 0;
-        for (size_t i = 0; i < len; ++i)
+        sqlite3_stmt *stmt = nullptr;
+        bool exists = false;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", -1, &stmt, nullptr) == SQLITE_OK)
         {
-            crc ^= static_cast<uint8_t>(data[i]);
-            for (int j = 0; j < 8; ++j)
-            {
-                if (crc & 1)
-                    crc = (crc >> 1) ^ POLY;
-                else
-                    crc >>= 1;
-            }
+            sqlite3_bind_text(stmt, 1, table, -1, SQLITE_STATIC);
+            exists = sqlite3_step(stmt) == SQLITE_ROW;
+            sqlite3_finalize(stmt);
         }
-        return crc;
+        return exists;
     }
 
-    static std::string pathToCrc(const char *path)
+    static bool hasColumn(sqlite3 *db, const char *table, const char *column)
     {
-        uint64_t v = crc64(path, strlen(path));
-        char buf[17];
-        snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)v);
-        return buf;
+        const std::string sql = std::string("PRAGMA table_info(") + table + ")";
+        sqlite3_stmt *stmt = nullptr;
+        bool found = false;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char *name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+                if (name && strcmp(name, column) == 0)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+        return found;
+    }
+
+    static std::string columnText(sqlite3_stmt *stmt, int index)
+    {
+        const auto *value = reinterpret_cast<const char *>(sqlite3_column_text(stmt, index));
+        return value ? value : "";
+    }
+
+    // Mirrors makeTrackIdentity(): title+artist is stable across file moves;
+    // rows without both tags fall back to the legacy path CRC.
+    static std::string trackIdentitySql(const char *alias)
+    {
+        const std::string prefix = std::string(alias) + ".";
+        const std::string title = prefix + "title";
+        const std::string artist = prefix + "artist";
+        const std::string crc = prefix + "track_crc";
+        return "CASE WHEN length(trim(COALESCE(" + title + ",'')))>0 AND length(trim(COALESCE(" + artist + ",'')))>0 "
+               "THEN 'meta:' || lower(trim(" + title + ")) || char(31) || lower(trim(" + artist + ")) "
+               "ELSE 'path:' || COALESCE(" + crc + ",'') END";
     }
 
     // -----------------------------------------------------------------------
@@ -101,69 +126,69 @@ namespace fms
         m_cv.notify_one();
     }
 
+    void DbManager::flush()
+    {
+        std::unique_lock<std::mutex> lk(m_mutex);
+        m_cv.wait(lk, [this]
+                  { return m_queue.empty() && !m_processing; });
+    }
+
     void DbManager::refreshPeriod(const std::string &period, bool isYear)
     {
         if (!m_db)
             return;
+        flush();
 
-        // Determine mode from period string length: 4=Year, 7=Month, 10=Day
-        bool isDay = (period.size() == 10);
-
-        // 1. Delete existing monthly_count entries for this period
+        const bool isDay = period.size() == 10;
+        const char *deleteSql = isYear
+                                    ? "DELETE FROM monthly_count WHERE SUBSTR(ymd,1,4)=?"
+                                : isDay
+                                    ? "DELETE FROM monthly_count WHERE ymd=?"
+                                    : "DELETE FROM monthly_count WHERE SUBSTR(ymd,1,7)=?";
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(m_db, deleteSql, -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_stmt *stmt = nullptr;
-            const char *sql = isYear
-                                  ? "DELETE FROM monthly_count WHERE SUBSTR(ymd, 1, 4) = ?"
-                              : isDay
-                                  ? "DELETE FROM monthly_count WHERE ymd = ?"
-                                  : "DELETE FROM monthly_count WHERE SUBSTR(ymd, 1, 7) = ?";
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-            {
-                // For year/month: period already has the right format for SUBSTR comparison
-                sqlite3_bind_text(stmt, 1, period.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-            }
+            sqlite3_bind_text(stmt, 1, period.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
         }
 
-        // 2. Recalculate from play_log
-        {
-            sqlite3_stmt *stmt = nullptr;
-            const char *sql =
-                "INSERT INTO monthly_count(ymd, track_crc, path, title, artist, album, length_seconds, playcount, total_time_seconds)"
-                " SELECT strftime('%Y-%m-%d', datetime(played_at/1000, 'unixepoch', 'localtime')) AS ymd,"
-                "        track_crc, path, title, artist, album,"
-                "        MAX(length_seconds) AS length_seconds,"
-                "        COUNT(*) AS playcount,"
-                "        SUM(length_seconds) AS total_time_seconds"
-                " FROM play_log"
-                " WHERE strftime('%Y-%m-%d', datetime(played_at/1000, 'unixepoch', 'localtime'))"
-                "       LIKE ? ESCAPE '\\'"
-                " GROUP BY ymd, track_crc, path, title, artist, album";
+        const std::string identity = trackIdentitySql("play_log");
+        const std::string sql =
+            "INSERT INTO monthly_count(ymd,track_crc,path,title,artist,album,length_seconds,playcount,total_time_seconds) "
+            "SELECT strftime('%Y-%m-%d',datetime(played_at/1000,'unixepoch','localtime')), " + identity +
+            ", MAX(path), MAX(title), MAX(artist), MAX(album), MAX(length_seconds), SUM(play_count), SUM(listened_seconds) "
+            "FROM play_log WHERE strftime('%Y-%m-%d',datetime(played_at/1000,'unixepoch','localtime')) LIKE ? ESCAPE '\\' "
+            "GROUP BY strftime('%Y-%m-%d',datetime(played_at/1000,'unixepoch','localtime')), " + identity +
+            " HAVING SUM(play_count)>0 OR SUM(listened_seconds)>0";
 
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-            {
-                // Year: "2026-%", Month: "2026-03-%", Day: "2026-03-04" (exact)
-                std::string pattern = isYear ? (period + "-%") : isDay ? period
-                                                                       : (period + "-%");
-                sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-            }
+        if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            const std::string pattern = isYear ? period + "-%" : isDay ? period : period + "-%";
+            sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        else
+        {
+            FB2K_console_formatter() << "foo_monthly_stats: refreshPeriod prepare error: " << sqlite3_errmsg(m_db);
         }
     }
 
-    void DbManager::deleteEntry(const std::string &ymd, const std::string &track_crc)
+    void DbManager::deleteEntry(const std::string &period, bool isYear, bool isDay, const std::string &track_identity)
     {
         if (!m_db)
             return;
+        flush();
 
+        const std::string identity = trackIdentitySql("monthly_count");
+        const std::string periodClause = isYear ? "SUBSTR(ymd,1,4)=?" : isDay ? "ymd=?" : "SUBSTR(ymd,1,7)=?";
+        const std::string sql = "DELETE FROM monthly_count WHERE " + periodClause + " AND " + identity + "=?";
         sqlite3_stmt *stmt = nullptr;
-        const char *sql = "DELETE FROM monthly_count WHERE ymd = ? AND track_crc = ?";
-        if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_bind_text(stmt, 1, ymd.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, track_crc.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, period.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, track_identity.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_step(stmt);
             sqlite3_finalize(stmt);
         }
@@ -184,27 +209,29 @@ namespace fms
                     continue;
                 item = m_queue.front();
                 m_queue.pop();
+                m_processing = true;
             }
             insertPlay(item);
+            {
+                std::lock_guard<std::mutex> lk(m_mutex);
+                m_processing = false;
+            }
+            m_cv.notify_all();
         }
     }
 
     void DbManager::ensureSchema()
     {
         char *errmsg = nullptr;
-
-        // Always ensure play_log exists
+        const bool playLogExisted = tableExists(m_db, "play_log");
+        const bool hadPlayCount = playLogExisted && hasColumn(m_db, "play_log", "play_count");
+        const bool hadListenedSeconds = playLogExisted && hasColumn(m_db, "play_log", "listened_seconds");
         sqlite3_exec(m_db,
                      "CREATE TABLE IF NOT EXISTS play_log ("
-                     "  id        INTEGER PRIMARY KEY,"
-                     "  track_crc TEXT NOT NULL,"
-                     "  path      TEXT NOT NULL DEFAULT '',"
-                     "  title     TEXT,"
-                     "  artist    TEXT,"
-                     "  album     TEXT,"
-                     "  length_seconds REAL NOT NULL DEFAULT 0,"
-                     "  played_at INTEGER NOT NULL"
-                     ");"
+                     " id INTEGER PRIMARY KEY, track_crc TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',"
+                     " title TEXT, artist TEXT, album TEXT, length_seconds REAL NOT NULL DEFAULT 0,"
+                     " played_at INTEGER NOT NULL, play_count INTEGER NOT NULL DEFAULT 0,"
+                     " listened_seconds REAL NOT NULL DEFAULT 0);"
                      "CREATE INDEX IF NOT EXISTS ix_played_at ON play_log(played_at);",
                      nullptr, nullptr, &errmsg);
         if (errmsg)
@@ -213,13 +240,21 @@ namespace fms
             sqlite3_free(errmsg);
         }
 
-        // Add missing columns to play_log (ignore errors if already exists)
-        sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN path TEXT NOT NULL DEFAULT ''", nullptr, nullptr, nullptr);
-        sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN length_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "play_log", "path"))
+            sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN path TEXT NOT NULL DEFAULT ''", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "play_log", "length_seconds"))
+            sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN length_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "play_log", "play_count"))
+            sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (playLogExisted && !hadPlayCount)
+        {
+            // Legacy zero-duration rows came from on_item_played; positive rows were
+            // position snapshots and are deliberately not imported as accurate time.
+            sqlite3_exec(m_db, "UPDATE play_log SET play_count=CASE WHEN COALESCE(length_seconds,0)=0 THEN 1 ELSE 0 END", nullptr, nullptr, nullptr);
+        }
+        if (!hasColumn(m_db, "play_log", "listened_seconds"))
+            sqlite3_exec(m_db, "ALTER TABLE play_log ADD COLUMN listened_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
 
-        // -----------------------------------------------------------------------
-        // Detect old schema: monthly_count with 'ym' column (pre-1.3.4)
-        // -----------------------------------------------------------------------
         bool hasYmColumn = false;
         bool hasYmdColumn = false;
         {
@@ -228,12 +263,12 @@ namespace fms
             {
                 while (sqlite3_step(info) == SQLITE_ROW)
                 {
-                    const char *col = reinterpret_cast<const char *>(sqlite3_column_text(info, 1));
-                    if (!col)
+                    const char *column = reinterpret_cast<const char *>(sqlite3_column_text(info, 1));
+                    if (!column)
                         continue;
-                    if (strcmp(col, "ym") == 0)
+                    if (strcmp(column, "ym") == 0)
                         hasYmColumn = true;
-                    if (strcmp(col, "ymd") == 0)
+                    if (strcmp(column, "ymd") == 0)
                         hasYmdColumn = true;
                 }
                 sqlite3_finalize(info);
@@ -242,251 +277,128 @@ namespace fms
 
         if (hasYmColumn && !hasYmdColumn)
         {
-            // ---------------------------------------------------------------
-            // Migrate from old schema (ym TEXT PRIMARY KEY) to new (ymd TEXT)
-            // Strategy: create new table, copy with ym||'-01', swap
-            // ---------------------------------------------------------------
             FB2K_console_formatter() << "foo_monthly_stats: migrating monthly_count schema (ym -> ymd) ...";
             sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
-
-            // Create new table with ymd column
-            sqlite3_exec(m_db,
-                         "CREATE TABLE monthly_count_new ("
-                         "  ymd       TEXT NOT NULL,"
-                         "  track_crc TEXT NOT NULL,"
-                         "  path      TEXT NOT NULL DEFAULT '',"
-                         "  title     TEXT,"
-                         "  artist    TEXT,"
-                         "  album     TEXT,"
-                         "  length_seconds REAL NOT NULL DEFAULT 0,"
-                         "  playcount INTEGER NOT NULL DEFAULT 0,"
-                         "  total_time_seconds REAL NOT NULL DEFAULT 0,"
-                         "  PRIMARY KEY (ymd, track_crc)"
-                         ");",
-                         nullptr, nullptr, &errmsg);
-            if (errmsg)
+            const char *createNew =
+                "CREATE TABLE monthly_count_new (ymd TEXT NOT NULL,track_crc TEXT NOT NULL,path TEXT NOT NULL DEFAULT '',"
+                "title TEXT,artist TEXT,album TEXT,length_seconds REAL NOT NULL DEFAULT 0,playcount INTEGER NOT NULL DEFAULT 0,"
+                "total_time_seconds REAL NOT NULL DEFAULT 0,PRIMARY KEY(ymd,track_crc));";
+            if (sqlite3_exec(m_db, createNew, nullptr, nullptr, &errmsg) == SQLITE_OK)
             {
-                FB2K_console_formatter() << "foo_monthly_stats: create new table error: " << errmsg;
-                sqlite3_free(errmsg);
-                sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
-            }
-            else
-            {
-                // Copy data: ym (YYYY-MM) -> ymd (YYYY-MM-01)
                 sqlite3_exec(m_db,
                              "INSERT OR IGNORE INTO monthly_count_new "
-                             " SELECT ym || '-01', track_crc,"
-                             "        COALESCE(path,''), title, artist, album,"
-                             "        COALESCE(length_seconds,0), playcount,"
-                             "        COALESCE(total_time_seconds,0)"
-                             " FROM monthly_count;",
+                             "SELECT ym||'-01',track_crc,COALESCE(path,''),title,artist,album,"
+                             "COALESCE(length_seconds,0),COALESCE(playcount,0),0 FROM monthly_count;",
                              nullptr, nullptr, &errmsg);
                 if (errmsg)
                 {
-                    FB2K_console_formatter() << "foo_monthly_stats: copy data error: " << errmsg;
+                    FB2K_console_formatter() << "foo_monthly_stats: old monthly_count copy error: " << errmsg;
                     sqlite3_free(errmsg);
+                    errmsg = nullptr;
                 }
-
                 sqlite3_exec(m_db, "DROP TABLE monthly_count;", nullptr, nullptr, nullptr);
                 sqlite3_exec(m_db, "ALTER TABLE monthly_count_new RENAME TO monthly_count;", nullptr, nullptr, nullptr);
                 sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
-                FB2K_console_formatter() << "foo_monthly_stats: schema migration complete";
+            }
+            else
+            {
+                if (errmsg)
+                {
+                    FB2K_console_formatter() << "foo_monthly_stats: monthly_count migration error: " << errmsg;
+                    sqlite3_free(errmsg);
+                    errmsg = nullptr;
+                }
+                sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
             }
         }
         else if (!hasYmColumn && !hasYmdColumn)
         {
-            // Fresh install: create monthly_count with ymd column
             sqlite3_exec(m_db,
                          "CREATE TABLE IF NOT EXISTS monthly_count ("
-                         "  ymd       TEXT NOT NULL,"
-                         "  track_crc TEXT NOT NULL,"
-                         "  path      TEXT NOT NULL DEFAULT '',"
-                         "  title     TEXT,"
-                         "  artist    TEXT,"
-                         "  album     TEXT,"
-                         "  length_seconds REAL NOT NULL DEFAULT 0,"
-                         "  playcount INTEGER NOT NULL DEFAULT 0,"
-                         "  total_time_seconds REAL NOT NULL DEFAULT 0,"
-                         "  PRIMARY KEY (ymd, track_crc)"
-                         ");",
+                         " ymd TEXT NOT NULL,track_crc TEXT NOT NULL,path TEXT NOT NULL DEFAULT '',"
+                         " title TEXT,artist TEXT,album TEXT,length_seconds REAL NOT NULL DEFAULT 0,"
+                         " playcount INTEGER NOT NULL DEFAULT 0,total_time_seconds REAL NOT NULL DEFAULT 0,"
+                         " PRIMARY KEY(ymd,track_crc));",
                          nullptr, nullptr, &errmsg);
             if (errmsg)
             {
                 FB2K_console_formatter() << "foo_monthly_stats: monthly_count schema error: " << errmsg;
                 sqlite3_free(errmsg);
+                errmsg = nullptr;
             }
         }
-        // else: hasYmdColumn == true → already on new schema, nothing to do
 
-        // Add missing columns to monthly_count (ignore errors if already exists)
-        sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN path TEXT NOT NULL DEFAULT ''", nullptr, nullptr, nullptr);
-        sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN length_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
-        sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN total_time_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "monthly_count", "path"))
+            sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN path TEXT NOT NULL DEFAULT ''", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "monthly_count", "length_seconds"))
+            sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN length_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "monthly_count", "playcount"))
+            sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN playcount INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+        if (!hasColumn(m_db, "monthly_count", "total_time_seconds"))
+            sqlite3_exec(m_db, "ALTER TABLE monthly_count ADD COLUMN total_time_seconds REAL NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
 
-        // Create temporary table for deduplication (will be cleared after use)
-        sqlite3_exec(m_db,
-                     "CREATE TABLE IF NOT EXISTS monthly_count_temp ("
-                     "  ymd       TEXT NOT NULL,"
-                     "  track_crc TEXT NOT NULL,"
-                     "  path      TEXT NOT NULL DEFAULT '',"
-                     "  title     TEXT,"
-                     "  artist    TEXT,"
-                     "  album     TEXT,"
-                     "  length_seconds REAL NOT NULL DEFAULT 0,"
-                     "  playcount INTEGER NOT NULL DEFAULT 0,"
-                     "  total_time_seconds REAL NOT NULL DEFAULT 0,"
-                     "  PRIMARY KEY (ymd, track_crc)"
-                     ");",
-                     nullptr, nullptr, nullptr);
-
-        // Remove duplicates on initialization (merge same titles by metadata)
-        removeDuplicates();
+        if (!playLogExisted || !hadListenedSeconds)
+        {
+            // The old total_time_seconds mixed playback-position snapshots with
+            // event counts. Preserve play counts, but start accurate time at zero.
+            sqlite3_exec(m_db, "UPDATE monthly_count SET total_time_seconds=0", nullptr, nullptr, nullptr);
+        }
     }
 
     void DbManager::insertPlay(const TrackInfo &info)
     {
-        // 1. Insert into play_log
-        {
-            sqlite3_stmt *stmt = nullptr;
-            const char *sql =
-                "INSERT INTO play_log(track_crc,path,title,artist,album,length_seconds,played_at) VALUES(?,?,?,?,?,?,?)";
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-            {
-                sqlite3_bind_text(stmt, 1, info.track_crc.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, info.path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 3, info.title.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 4, info.artist.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 5, info.album.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_double(stmt, 6, info.length_seconds);
-                sqlite3_bind_int64(stmt, 7, info.played_at);
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-            }
-        }
-
-        // 2. Determine YYYY-MM-DD from played_at (local time)
         time_t t = static_cast<time_t>(info.played_at / 1000);
-        struct tm local_tm;
+        struct tm local_tm{};
 #ifdef _WIN32
         localtime_s(&local_tm, &t);
 #else
         localtime_r(&t, &local_tm);
 #endif
-        char ymd[11];
+        char ymd[11] = {};
         strftime(ymd, sizeof(ymd), "%Y-%m-%d", &local_tm);
 
-        // 3. Upsert into monthly_count
+        sqlite3_stmt *stmt = nullptr;
+        const char *logSql = "INSERT INTO play_log(track_crc,path,title,artist,album,length_seconds,played_at,play_count,listened_seconds) VALUES(?,?,?,?,?,0,?,?,?)";
+        if (sqlite3_prepare_v2(m_db, logSql, -1, &stmt, nullptr) != SQLITE_OK)
         {
-            sqlite3_stmt *stmt = nullptr;
-            const char *sql =
-                "INSERT INTO monthly_count(ymd,track_crc,path,title,artist,album,length_seconds,playcount,total_time_seconds) VALUES(?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(ymd,track_crc) DO UPDATE SET playcount=playcount+excluded.playcount,"
-                "  total_time_seconds=total_time_seconds+excluded.total_time_seconds,"
-                "  path=excluded.path, title=excluded.title, artist=excluded.artist, album=excluded.album, length_seconds=excluded.length_seconds";
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-            {
-                sqlite3_bind_text(stmt, 1, ymd, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, info.track_crc.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 3, info.path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 4, info.title.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 5, info.artist.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 6, info.album.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_double(stmt, 7, info.length_seconds);
-                // playcount: 1 when on_item_played fires (length=0), 0 when on_playback_stop fires
-                sqlite3_bind_int(stmt, 8, (info.length_seconds == 0.0) ? 1 : 0);
-                // total_time_seconds: actual played seconds (0 on item_played, real value on stop)
-                sqlite3_bind_double(stmt, 9, info.length_seconds);
-                int rc = sqlite3_step(stmt);
-                if (rc != SQLITE_DONE && rc != SQLITE_ROW)
-                {
-                    FB2K_console_formatter() << "foo_monthly_stats: monthly_count insert error: "
-                                             << sqlite3_errmsg(m_db) << " (ymd=" << ymd << ")";
-                }
-                sqlite3_finalize(stmt);
-            }
-            else
-            {
-                FB2K_console_formatter() << "foo_monthly_stats: monthly_count prepare error: " << sqlite3_errmsg(m_db);
-            }
-        }
-    }
-
-    void DbManager::removeDuplicates()
-    {
-        if (!m_db)
-            return;
-
-        // Detect and consolidate duplicate entries with same title/artist/album but different track_crc
-        // This handles the case where files were moved/renamed and acquired different CRCs
-
-        sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
-
-        // Step 1: Create a temporary table with consolidated data
-        sqlite3_exec(m_db, "DELETE FROM monthly_count_temp;", nullptr, nullptr, nullptr);
-
-        // For each group of (title, artist, album), use the first encountered track_crc as canonical
-        // and sum up all playcounts and times
-        const char *consolidateSql =
-            "INSERT INTO monthly_count_temp "
-            "SELECT ymd, "
-            "       MIN(track_crc) AS track_crc,"
-            "       MAX(path) AS path,"
-            "       title, artist, album,"
-            "       MAX(length_seconds) AS length_seconds,"
-            "       SUM(playcount) AS playcount,"
-            "       SUM(total_time_seconds) AS total_time_seconds"
-            " FROM monthly_count"
-            " WHERE title != '' AND artist != '' AND album != ''"
-            " GROUP BY ymd, title, artist, album"
-            " HAVING COUNT(DISTINCT track_crc) > 1";
-
-        if (sqlite3_exec(m_db, consolidateSql, nullptr, nullptr, nullptr) != SQLITE_OK)
-        {
-            FB2K_console_formatter() << "foo_monthly_stats: consolidate duplicates error: " << sqlite3_errmsg(m_db);
-            sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
+            FB2K_console_formatter() << "foo_monthly_stats: play_log prepare error: " << sqlite3_errmsg(m_db);
             return;
         }
+        sqlite3_bind_text(stmt, 1, info.track_crc.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, info.path.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, info.title.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, info.artist.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, info.album.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 6, info.played_at);
+        sqlite3_bind_int64(stmt, 7, info.play_count);
+        sqlite3_bind_double(stmt, 8, info.listened_seconds);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            FB2K_console_formatter() << "foo_monthly_stats: play_log insert error: " << sqlite3_errmsg(m_db);
+        sqlite3_finalize(stmt);
 
-        // Check how many duplicates we found
-        int dupCount = 0;
+        const char *countSql =
+            "INSERT INTO monthly_count(ymd,track_crc,path,title,artist,album,length_seconds,playcount,total_time_seconds) VALUES(?,?,?,?,?,?,0,?,?) "
+            "ON CONFLICT(ymd,track_crc) DO UPDATE SET playcount=playcount+excluded.playcount, "
+            "total_time_seconds=total_time_seconds+excluded.total_time_seconds, "
+            "path=excluded.path,title=excluded.title,artist=excluded.artist,album=excluded.album";
+        if (sqlite3_prepare_v2(m_db, countSql, -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_stmt *stmt = nullptr;
-            const char *sql = "SELECT COUNT(*) FROM monthly_count_temp;";
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-            {
-                if (sqlite3_step(stmt) == SQLITE_ROW)
-                {
-                    dupCount = sqlite3_column_int(stmt, 0);
-                }
-                sqlite3_finalize(stmt);
-            }
+            sqlite3_bind_text(stmt, 1, ymd, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, info.track_crc.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, info.path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 4, info.title.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 5, info.artist.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 6, info.album.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 7, info.play_count);
+            sqlite3_bind_double(stmt, 8, info.listened_seconds);
+            if (sqlite3_step(stmt) != SQLITE_DONE)
+                FB2K_console_formatter() << "foo_monthly_stats: monthly_count upsert error: " << sqlite3_errmsg(m_db);
+            sqlite3_finalize(stmt);
         }
-
-        if (dupCount > 0)
+        else
         {
-            // Step 2: Remove old entries for duplicated groups
-            // Find which (title, artist, album) groups had duplicates
-            sqlite3_exec(m_db,
-                         "DELETE FROM monthly_count "
-                         " WHERE (title, artist, album) IN "
-                         "   (SELECT DISTINCT title, artist, album FROM monthly_count_temp);",
-                         nullptr, nullptr, nullptr);
-
-            // Step 3: Insert consolidated entries
-            sqlite3_exec(m_db,
-                         "INSERT INTO monthly_count "
-                         " SELECT ymd, track_crc, path, title, artist, album, "
-                         "        length_seconds, playcount, total_time_seconds"
-                         " FROM monthly_count_temp;",
-                         nullptr, nullptr, nullptr);
-
-            // Step 4: Clear temp table
-            sqlite3_exec(m_db, "DELETE FROM monthly_count_temp;", nullptr, nullptr, nullptr);
-
-            FB2K_console_formatter() << "foo_monthly_stats: consolidated " << dupCount << " duplicate track entries";
+            FB2K_console_formatter() << "foo_monthly_stats: monthly_count prepare error: " << sqlite3_errmsg(m_db);
         }
-
-        sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
     }
 
     std::vector<MonthlyEntry> DbManager::queryMonth(const std::string &ym)
@@ -495,52 +407,45 @@ namespace fms
         if (!m_db)
             return result;
 
-        // Aggregate daily rows into monthly totals
-        // Use correlated subquery for prev_playcount to avoid JOIN cross-multiplication
-        sqlite3_stmt *stmt = nullptr;
-        const char *sql =
-            "SELECT c.track_crc, c.path, c.title, c.artist, c.album,"
-            "       MAX(c.length_seconds) AS length_seconds,"
-            "       SUM(c.playcount) AS playcount,"
-            "       SUM(c.total_time_seconds) AS total_time_seconds,"
-            "       COALESCE((SELECT SUM(p.playcount) FROM monthly_count p"
-            "                 WHERE p.track_crc = c.track_crc AND SUBSTR(p.ymd,1,7) = ?), 0) AS prev_pc"
-            " FROM monthly_count c"
-            " WHERE SUBSTR(c.ymd, 1, 7) = ?"
-            " GROUP BY c.track_crc, c.path, c.title, c.artist, c.album"
-            " HAVING SUM(c.playcount) > 0"
-            " ORDER BY playcount DESC";
-
-        // Compute previous month for delta comparison
         int year = std::stoi(ym.substr(0, 4));
-        int month = std::stoi(ym.substr(5, 2));
-        month--;
+        int month = std::stoi(ym.substr(5, 2)) - 1;
         if (month == 0)
         {
             month = 12;
-            year--;
+            --year;
         }
-        char prevYm[8];
-        snprintf(prevYm, sizeof(prevYm), "%04d-%02d", year, month);
+        char previous[8] = {};
+        snprintf(previous, sizeof(previous), "%04d-%02d", year, month);
 
-        if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        const std::string key = trackIdentitySql("c");
+        const std::string previousKey = trackIdentitySql("p");
+        const std::string sql =
+            "SELECT " + key + ",MAX(c.path),MAX(c.title),MAX(c.artist),MAX(c.album),MAX(c.length_seconds),"
+            "SUM(c.playcount),SUM(c.total_time_seconds),COALESCE((SELECT SUM(p.playcount) FROM monthly_count p "
+            "WHERE SUBSTR(p.ymd,1,7)=? AND " + previousKey + "=" + key + "),0) "
+            "FROM monthly_count c WHERE SUBSTR(c.ymd,1,7)=? GROUP BY " + key +
+            " HAVING SUM(c.playcount)>0 OR SUM(c.total_time_seconds)>0 "
+            "ORDER BY SUM(c.total_time_seconds) DESC,SUM(c.playcount) DESC";
+
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_bind_text(stmt, 1, prevYm, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, previous, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2, ym.c_str(), -1, SQLITE_TRANSIENT);
             while (sqlite3_step(stmt) == SQLITE_ROW)
             {
-                MonthlyEntry e;
-                e.ymd = ym + "-01"; // representative date for monthly aggregate
-                e.track_crc = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
-                e.path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
-                e.title = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
-                e.artist = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
-                e.album = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
-                e.length_seconds = sqlite3_column_double(stmt, 5);
-                e.playcount = sqlite3_column_int64(stmt, 6);
-                e.total_time_seconds = sqlite3_column_double(stmt, 7);
-                e.prev_playcount = sqlite3_column_int64(stmt, 8);
-                result.push_back(std::move(e));
+                MonthlyEntry entry{};
+                entry.ymd = ym + "-01";
+                entry.track_crc = columnText(stmt, 0);
+                entry.path = columnText(stmt, 1);
+                entry.title = columnText(stmt, 2);
+                entry.artist = columnText(stmt, 3);
+                entry.album = columnText(stmt, 4);
+                entry.length_seconds = sqlite3_column_double(stmt, 5);
+                entry.playcount = sqlite3_column_int64(stmt, 6);
+                entry.total_time_seconds = sqlite3_column_double(stmt, 7);
+                entry.prev_playcount = sqlite3_column_int64(stmt, 8);
+                result.push_back(std::move(entry));
             }
             sqlite3_finalize(stmt);
         }
@@ -557,58 +462,59 @@ namespace fms
         if (!m_db)
             return result;
 
-        // Single day data
-        sqlite3_stmt *stmt = nullptr;
-        const char *sql =
-            "SELECT c.ymd, c.track_crc, c.path, c.title, c.artist, c.album, c.length_seconds, c.playcount, c.total_time_seconds,"
-            "       COALESCE(p.playcount, 0) AS prev_pc"
-            " FROM monthly_count c"
-            " LEFT JOIN monthly_count p"
-            "   ON p.track_crc = c.track_crc AND p.ymd = ?"
-            " WHERE c.ymd = ? AND c.playcount > 0"
-            " ORDER BY c.playcount DESC";
-
-        // Compute previous day for delta
         int year = std::stoi(ymd.substr(0, 4));
         int month = std::stoi(ymd.substr(5, 2));
-        int day = std::stoi(ymd.substr(8, 2));
-        day--;
+        int day = std::stoi(ymd.substr(8, 2)) - 1;
         if (day == 0)
         {
-            month--;
+            --month;
             if (month == 0)
             {
                 month = 12;
-                year--;
+                --year;
             }
-            // Quick approximation: use last day of previous month
-            static const int daysInMonth[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-            int leap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) ? 1 : 0;
+            static const int daysInMonth[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            const int leap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) ? 1 : 0;
             day = daysInMonth[month] + (month == 2 ? leap : 0);
         }
-        char prevYmd[11];
-        snprintf(prevYmd, sizeof(prevYmd), "%04d-%02d-%02d", year, month, day);
+        char previous[11] = {};
+        snprintf(previous, sizeof(previous), "%04d-%02d-%02d", year, month, day);
 
-        if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        const std::string key = trackIdentitySql("c");
+        const std::string previousKey = trackIdentitySql("p");
+        const std::string sql =
+            "SELECT " + key + ",MAX(c.path),MAX(c.title),MAX(c.artist),MAX(c.album),MAX(c.length_seconds),"
+            "SUM(c.playcount),SUM(c.total_time_seconds),COALESCE((SELECT SUM(p.playcount) FROM monthly_count p "
+            "WHERE p.ymd=? AND " + previousKey + "=" + key + "),0) "
+            "FROM monthly_count c WHERE c.ymd=? GROUP BY " + key +
+            " HAVING SUM(c.playcount)>0 OR SUM(c.total_time_seconds)>0 "
+            "ORDER BY SUM(c.total_time_seconds) DESC,SUM(c.playcount) DESC";
+
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_bind_text(stmt, 1, prevYmd, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, previous, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2, ymd.c_str(), -1, SQLITE_TRANSIENT);
             while (sqlite3_step(stmt) == SQLITE_ROW)
             {
-                MonthlyEntry e;
-                e.ymd = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
-                e.track_crc = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
-                e.path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
-                e.title = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
-                e.artist = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
-                e.album = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
-                e.length_seconds = sqlite3_column_double(stmt, 6);
-                e.playcount = sqlite3_column_int64(stmt, 7);
-                e.total_time_seconds = sqlite3_column_double(stmt, 8);
-                e.prev_playcount = sqlite3_column_int64(stmt, 9);
-                result.push_back(std::move(e));
+                MonthlyEntry entry{};
+                entry.ymd = ymd;
+                entry.track_crc = columnText(stmt, 0);
+                entry.path = columnText(stmt, 1);
+                entry.title = columnText(stmt, 2);
+                entry.artist = columnText(stmt, 3);
+                entry.album = columnText(stmt, 4);
+                entry.length_seconds = sqlite3_column_double(stmt, 5);
+                entry.playcount = sqlite3_column_int64(stmt, 6);
+                entry.total_time_seconds = sqlite3_column_double(stmt, 7);
+                entry.prev_playcount = sqlite3_column_int64(stmt, 8);
+                result.push_back(std::move(entry));
             }
             sqlite3_finalize(stmt);
+        }
+        else
+        {
+            FB2K_console_formatter() << "foo_monthly_stats: queryDay prepare error: " << sqlite3_errmsg(m_db);
         }
         return result;
     }
@@ -619,43 +525,42 @@ namespace fms
         if (!m_db)
             return result;
 
+        const std::string previous = std::to_string(std::stoi(year) - 1);
+        const std::string key = trackIdentitySql("c");
+        const std::string previousKey = trackIdentitySql("p");
+        const std::string sql =
+            "SELECT " + key + ",MAX(c.path),MAX(c.title),MAX(c.artist),MAX(c.album),MAX(c.length_seconds),"
+            "SUM(c.playcount),SUM(c.total_time_seconds),COALESCE((SELECT SUM(p.playcount) FROM monthly_count p "
+            "WHERE SUBSTR(p.ymd,1,4)=? AND " + previousKey + "=" + key + "),0) "
+            "FROM monthly_count c WHERE SUBSTR(c.ymd,1,4)=? GROUP BY " + key +
+            " HAVING SUM(c.playcount)>0 OR SUM(c.total_time_seconds)>0 "
+            "ORDER BY SUM(c.total_time_seconds) DESC,SUM(c.playcount) DESC";
+
         sqlite3_stmt *stmt = nullptr;
-        // Use subquery for prev_playcount to avoid double-counting from cross-JOIN
-        const char *sql =
-            "SELECT c.track_crc, c.path, c.title, c.artist, c.album,"
-            "       MAX(c.length_seconds) AS length_seconds,"
-            "       SUM(c.playcount) AS total_plays,"
-            "       SUM(c.total_time_seconds) AS total_time,"
-            "       COALESCE((SELECT SUM(p.playcount) FROM monthly_count p"
-            "                 WHERE p.track_crc = c.track_crc AND SUBSTR(p.ymd,1,4) = ?), 0) AS prev_total"
-            " FROM monthly_count c"
-            " WHERE SUBSTR(c.ymd, 1, 4) = ?"
-            " GROUP BY c.track_crc, c.path, c.title, c.artist, c.album"
-            " HAVING SUM(c.playcount) > 0"
-            " ORDER BY total_plays DESC";
-
-        std::string prevYear = std::to_string(std::stoi(year) - 1);
-
-        if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
         {
-            sqlite3_bind_text(stmt, 1, prevYear.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, previous.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2, year.c_str(), -1, SQLITE_TRANSIENT);
             while (sqlite3_step(stmt) == SQLITE_ROW)
             {
-                MonthlyEntry e;
-                e.ymd = year + "-01-01"; // Representative date for yearly aggregate
-                e.track_crc = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
-                e.path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
-                e.title = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
-                e.artist = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
-                e.album = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
-                e.length_seconds = sqlite3_column_double(stmt, 5);
-                e.playcount = sqlite3_column_int64(stmt, 6);
-                e.total_time_seconds = sqlite3_column_double(stmt, 7);
-                e.prev_playcount = sqlite3_column_int64(stmt, 8);
-                result.push_back(std::move(e));
+                MonthlyEntry entry{};
+                entry.ymd = year + "-01-01";
+                entry.track_crc = columnText(stmt, 0);
+                entry.path = columnText(stmt, 1);
+                entry.title = columnText(stmt, 2);
+                entry.artist = columnText(stmt, 3);
+                entry.album = columnText(stmt, 4);
+                entry.length_seconds = sqlite3_column_double(stmt, 5);
+                entry.playcount = sqlite3_column_int64(stmt, 6);
+                entry.total_time_seconds = sqlite3_column_double(stmt, 7);
+                entry.prev_playcount = sqlite3_column_int64(stmt, 8);
+                result.push_back(std::move(entry));
             }
             sqlite3_finalize(stmt);
+        }
+        else
+        {
+            FB2K_console_formatter() << "foo_monthly_stats: queryYear prepare error: " << sqlite3_errmsg(m_db);
         }
         return result;
     }

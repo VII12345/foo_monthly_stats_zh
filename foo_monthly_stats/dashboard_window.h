@@ -90,7 +90,7 @@ namespace fms
         ViewMode m_viewMode = MONTH;
         std::string m_period; // "YYYY-MM", "YYYY", or "YYYY-MM-DD"
         std::vector<MonthlyEntry> m_entries;
-        int m_sortCol = 4; // default: sort by plays
+        int m_sortCol = 5; // default: sort by accumulated listening time
         bool m_sortAsc = false;
         bool m_exportFormatIsSmartphone = false; // Toggle between Desktop and Smartphone HTML export
 

@@ -9,13 +9,15 @@ namespace fms
     // -----------------------------------------------------------------------
     struct TrackInfo
     {
-        std::string track_crc; // CRC64 of track path (hex string)
+        std::string track_crc; // Stable title/artist identity; path fallback when tags are incomplete
         std::string path;      // original file path (for album art lookup)
         std::string title;
         std::string artist;
         std::string album;
-        double length_seconds; // track length in seconds
-        int64_t played_at;     // UNIX epoch milliseconds
+        double length_seconds = 0.0; // Legacy column retained for existing databases
+        int64_t played_at = 0;       // UNIX epoch milliseconds
+        int64_t play_count = 0;      // Explicit count event; independent of listened time
+        double listened_seconds = 0.0;
     };
 
     // -----------------------------------------------------------------------
@@ -29,7 +31,7 @@ namespace fms
         std::string title;
         std::string artist;
         std::string album;
-        double length_seconds; // track length in seconds
+        double length_seconds; // Legacy track-length field (not used for listening-time totals)
         int64_t playcount;
         int64_t prev_playcount;    // same month previous year (for delta)
         double total_time_seconds; // actual total played time
@@ -55,16 +57,15 @@ namespace fms
         // Post a play event (non-blocking, returns immediately)
         void postPlay(const TrackInfo &info);
 
+        // Wait until all previously posted events have been persisted.
+        void flush();
+
         // Refresh a specific period by deleting and recalculating from play_log
         // period: "YYYY-MM" for month or "YYYY" for year
         void refreshPeriod(const std::string &period, bool isYear);
 
         // Delete a specific entry from monthly_count
-        void deleteEntry(const std::string &ymd, const std::string &track_crc);
-
-        // Remove duplicate entries in monthly_count (same title/artist/album with different paths)
-        // Consolidates entries with identical metadata into a single track_crc
-        void removeDuplicates();
+        void deleteEntry(const std::string &period, bool isYear, bool isDay, const std::string &track_identity);
 
         // Query monthly data synchronously (called on main thread for UI)
         std::vector<MonthlyEntry> queryMonth(const std::string &ym);
@@ -99,6 +100,7 @@ namespace fms
         std::condition_variable m_cv;
         std::atomic<bool> m_running{false};
         bool m_opened{false};
+        bool m_processing{false};
     };
 
 } // namespace fms

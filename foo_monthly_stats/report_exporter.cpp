@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "i18n.h"
+#include "duration_format.h"
 #include "report_exporter.h"
 #include "preferences.h"
 
@@ -746,18 +747,10 @@ h1 {
                     label.append_attribute("class") = "stat-label";
                     label.text().set(fms::tr("Total Time", "总播放时长"));
 
-                    int hours = static_cast<int>(totalSeconds / 3600);
-                    int minutes = static_cast<int>((totalSeconds - hours * 3600) / 60);
-
                     auto value = card.append_child("div");
                     value.append_attribute("class") = "stat-value";
-                    std::string timeText = std::to_string(hours) + fms::tr("h ", "小时 ") + std::to_string(minutes) + fms::tr("m", "分钟");
+                    const std::string timeText = fms::formatDuration(totalSeconds);
                     value.text().set(timeText.c_str());
-
-                    auto subtext = card.append_child("div");
-                    subtext.append_attribute("class") = "stat-subtext";
-                    std::string subtextStr = std::to_string(static_cast<long long>(totalSeconds)) + fms::tr(" seconds", " 秒");
-                    subtext.text().set(subtextStr.c_str());
                 }
             }
 
@@ -893,7 +886,7 @@ h1 {
                 std::vector<MonthlyEntry> sortedEntries = entries;
                 std::sort(sortedEntries.begin(), sortedEntries.end(),
                           [](const auto &a, const auto &b)
-                          { return a.playcount > b.playcount; });
+                          { return a.total_time_seconds != b.total_time_seconds ? a.total_time_seconds > b.total_time_seconds : a.playcount > b.playcount; });
 
                 auto tracksDiv = container.append_child("div");
                 tracksDiv.append_attribute("class") = "tracks-section";
@@ -950,8 +943,10 @@ h1 {
 
                     auto stats = info.append_child("div");
                     stats.append_attribute("class") = "track-stats";
-                    std::string playsText = std::to_string(e.playcount) + fms::tr(" plays", " 次播放");
-                    stats.text().set(playsText.c_str());
+                    const std::string trackStats = e.playcount > 0
+                                                       ? std::to_string(e.playcount) + fms::tr(" plays · ", " 次播放 · ") + fms::formatDuration(e.total_time_seconds)
+                                                       : fms::tr("Listening time: ", "收听时长：") + fms::formatDuration(e.total_time_seconds);
+                    stats.text().set(trackStats.c_str());
 
                     rank++;
                 }
@@ -1283,14 +1278,10 @@ window.addEventListener('load', function() {
                 totalSeconds += e.total_time_seconds;
             }
 
-            int hours = static_cast<int>(totalSeconds / 3600);
-            int minutes = static_cast<int>((totalSeconds - hours * 3600) / 60);
-            int seconds = static_cast<int>(totalSeconds - hours * 3600 - minutes * 60);
-
             auto stats = container.append_child("div");
             stats.append_attribute("style") = "text-align: center; margin: 1.5rem 0; font-size: 1.1rem; color: rgba(255,255,255,0.9);";
 
-            std::string timeText = fms::tr("Total Listening Time: ", "总播放时长：") + std::to_string(hours) + fms::tr("h ", "小时 ") + std::to_string(minutes) + fms::tr("m ", "分钟 ") + std::to_string(seconds) + fms::tr("s", "秒");
+            const std::string timeText = fms::tr("Total Listening Time: ", "总收听时长：") + fms::formatDuration(totalSeconds);
             stats.text().set(timeText.c_str());
         }
 
@@ -1438,7 +1429,9 @@ window.addEventListener('load', function() {
             // Plays
             auto plays = stats.append_child("div");
             plays.append_attribute("class") = "plays";
-            std::string playsText = "\xe2\x96\xb6 " + std::to_string(e.playcount) + fms::tr(" plays", " 次播放");
+            const std::string playsText = e.playcount > 0
+                                              ? "\xe2\x96\xb6 " + std::to_string(e.playcount) + fms::tr(" plays · ", " 次播放 · ") + fms::formatDuration(e.total_time_seconds)
+                                              : fms::tr("Listening time: ", "收听时长：") + fms::formatDuration(e.total_time_seconds);
             plays.text().set(playsText.c_str());
 
             // Delta

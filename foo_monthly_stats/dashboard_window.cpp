@@ -4,6 +4,7 @@
 #include "preferences.h"
 #include "resource.h"
 #include "i18n.h"
+#include "duration_format.h"
 
 namespace fms
 {
@@ -264,7 +265,7 @@ namespace fms
             if (index >= 0 && index < static_cast<int>(m_entries.size()))
             {
                 const auto &entry = m_entries[index];
-                DbManager::get().deleteEntry(entry.ymd, entry.track_crc);
+                DbManager::get().deleteEntry(m_period, m_viewMode == YEAR, m_viewMode == DAY, entry.track_crc);
             }
         }
 
@@ -406,20 +407,28 @@ namespace fms
             m_sortAsc = false;
         }
 
-        auto &e = m_entries;
-        std::stable_sort(e.begin(), e.end(), [&](const MonthlyEntry &a, const MonthlyEntry &b)
+        auto &entries = m_entries;
+        std::stable_sort(entries.begin(), entries.end(), [&](const MonthlyEntry &a, const MonthlyEntry &b)
                          {
-        bool lt = false;
-        switch (m_sortCol) {
-            case 0: lt = false; break;                    // rank – keep order
-            case 1: lt = a.title  < b.title;  break;
-            case 2: lt = a.artist < b.artist; break;
-            case 3: lt = a.album  < b.album;  break;
-            case 4: lt = a.playcount < b.playcount; break;
-            case 5: lt = (a.playcount - a.prev_playcount) < (b.playcount - b.prev_playcount); break;
-            default: break;
-        }
-        return m_sortAsc ? lt : !lt; });
+            int order = 0;
+            switch (m_sortCol)
+            {
+                case 1: order = a.title.compare(b.title); break;
+                case 2: order = a.artist.compare(b.artist); break;
+                case 3: order = a.album.compare(b.album); break;
+                case 4: order = a.playcount < b.playcount ? -1 : a.playcount > b.playcount ? 1 : 0; break;
+                case 5: order = a.total_time_seconds < b.total_time_seconds ? -1 : a.total_time_seconds > b.total_time_seconds ? 1 : 0; break;
+                case 6:
+                {
+                    const auto aDelta = a.playcount - a.prev_playcount;
+                    const auto bDelta = b.playcount - b.prev_playcount;
+                    order = aDelta < bDelta ? -1 : aDelta > bDelta ? 1 : 0;
+                    break;
+                }
+                default: order = a.title.compare(b.title); break;
+            }
+            return m_sortAsc ? order < 0 : order > 0;
+        });
 
         HWND hList = GetDlgItem(IDC_LIST_TRACKS);
         ListView_DeleteAllItems(hList);
@@ -443,8 +452,9 @@ namespace fms
             setCol(2, entry.artist);
             setCol(3, entry.album);
             setCol(4, std::to_string(entry.playcount));
+            setCol(5, fms::formatDuration(entry.total_time_seconds));
             int64_t delta = entry.playcount - entry.prev_playcount;
-            setCol(5, (delta >= 0 ? "+" : "") + std::to_string(delta));
+            setCol(6, (delta >= 0 ? "+" : "") + std::to_string(delta));
         }
         return 0;
     }
@@ -479,12 +489,13 @@ namespace fms
             deltaLabel = fms::isChinese() ? L"较去年" : L"前年比"; // Year-over-Year
 
         const Col cols[] = {
-            {L"#", 40},
-            {fms::isChinese() ? L"标题 – 艺术家" : L"Title – Artist", 260},
-            {fms::isChinese() ? L"艺术家" : L"Artist", 120},
-            {fms::isChinese() ? L"专辑" : L"Album", 120},
-            {fms::isChinese() ? L"播放次数" : L"Plays", 60},
-            {deltaLabel, 60},
+            {L"#", 32},
+            {fms::isChinese() ? L"标题 – 艺术家" : L"Title – Artist", 205},
+            {fms::isChinese() ? L"艺术家" : L"Artist", 110},
+            {fms::isChinese() ? L"专辑" : L"Album", 135},
+            {fms::isChinese() ? L"播放次数" : L"Plays", 65},
+            {fms::isChinese() ? L"收听时长" : L"Listening Time", 100},
+            {deltaLabel, 70},
         };
         LVCOLUMNW lvc{};
         lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
@@ -500,6 +511,7 @@ namespace fms
 
     void DashboardWindow::Populate()
     {
+        DbManager::get().flush();
         if (m_viewMode == MONTH)
             m_entries = DbManager::get().queryMonth(m_period);
         else if (m_viewMode == DAY)
@@ -509,7 +521,7 @@ namespace fms
 
         // Sort by playcount desc initially
         std::sort(m_entries.begin(), m_entries.end(), [](const MonthlyEntry &a, const MonthlyEntry &b)
-                  { return a.playcount > b.playcount; });
+                  { return a.total_time_seconds != b.total_time_seconds ? a.total_time_seconds > b.total_time_seconds : a.playcount > b.playcount; });
 
         HWND hList = GetDlgItem(IDC_LIST_TRACKS);
         ListView_DeleteAllItems(hList);
@@ -534,8 +546,9 @@ namespace fms
             setCol(2, e.artist);
             setCol(3, e.album);
             setCol(4, std::to_string(e.playcount));
+            setCol(5, fms::formatDuration(e.total_time_seconds));
             int64_t delta = e.playcount - e.prev_playcount;
-            setCol(5, (delta >= 0 ? "+" : "") + std::to_string(delta));
+            setCol(6, (delta >= 0 ? "+" : "") + std::to_string(delta));
             ++i;
         }
 
@@ -545,12 +558,8 @@ namespace fms
         {
             totalSeconds += e.total_time_seconds;
         }
-        int hours = static_cast<int>(totalSeconds / 3600);
-        int minutes = static_cast<int>((totalSeconds - hours * 3600) / 60);
-        int seconds = static_cast<int>(totalSeconds - hours * 3600 - minutes * 60);
-
         std::string statusText = fms::tr("Tracks: ", "歌曲数：") + std::to_string(m_entries.size()) +
-                                 fms::tr(" | Total Listening Time: ", " | 总播放时长：") + std::to_string(hours) + fms::tr("h ", "小时 ") + std::to_string(minutes) + fms::tr("m ", "分钟 ") + std::to_string(seconds) + fms::tr("s", "秒");
+                                 fms::tr(" | Total Listening Time: ", " | 总收听时长：") + fms::formatDuration(totalSeconds);
         SetStatus(statusText.c_str());
     }
 

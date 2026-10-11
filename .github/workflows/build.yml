@@ -1,4 +1,4 @@
-name: Build foo_monthly_stats
+name: Build foo_monthly_stats Chinese localization
 
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
         with:
           arch: x64
 
-      - name: Build foo_monthly_stats
+      - name: Build component
         working-directory: foo_monthly_stats
         run: |
           msbuild foo_monthly_stats.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /nologo /v:minimal
@@ -37,13 +37,13 @@ jobs:
       - name: Upload component package
         uses: actions/upload-artifact@v4
         with:
-          name: foo_monthly_stats-component
+          name: foo_monthly_stats_zh-component
           path: foo_monthly_stats/_result/foo_monthly_stats.fb2k-component
           if-no-files-found: error
 
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
-          name: foo_monthly_stats-dll
+          name: foo_monthly_stats_zh-dll
           path: foo_monthly_stats/_result/x64_Release/bin/foo_monthly_stats.dll
           if-no-files-found: error

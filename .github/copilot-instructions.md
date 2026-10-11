@@ -1,56 +1,12 @@
-# Copilot Instructions for foo_monthly_stats (Updated)
+# 仓库开发说明
 
-このプロジェクトは、月間/年間の音楽視聴統計を追跡・視覚化する **foobar2000 プラグイン（C++17）** です。
-以下の構成・手順を厳守し、**コードの生成や修正を行った後は、必ず末尾の `build.ps1` を実行して成功を確認してください。**
+本仓库是 foo_monthly_stats 的简体中文本地化分支。修改时遵循以下约定：
 
-## 1. 環境構成
-
-| 項目                 | 値                                            |
-| -------------------- | --------------------------------------------- |
-| **プラットフォーム** | x64 Release 専用                              |
-| **ツールセット**     | `v145` (VS 2026 Preview) / CIでは `v143`      |
-| **主要ライブラリ**   | WTL 10.0, foobar2000 SDK, SQLite 3, pugixml   |
-| **コンパイラフラグ** | `/utf-8` (Directory.Build.targets で指定済み) |
-
----
-
-## 2. プロジェクト構造と規約
-
-### 重要なファイル配置
-
-- `Directory.Build.props/targets`: 共通のビルドプロパティとインクルードパス。
-- `foo_monthly_stats.rc`: **重要**。必ず **BOM付きUTF-16LE** で保存すること（ビルドエラー防止）。
-- `stdafx.h`: `foobar2000+atl.h` を SDK ヘッダーより先に記述すること。
-
-### 実装ルール
-
-- **文字コード**: 入出力は UTF-8。UI表示時のみ UTF-16 に変換。
-- **スレッド処理**: DBへの書き込みは UI をブロックしないようワーカースレッドで実行。
-- **UI更新**: 処理完了後は `PostMessage` 等でメインスレッドに通知。
-
----
-
-## 3. 開発完了後の必須ビルド・テスト手順
-
-実装や修正が完了したら、プロジェクトルートにある統合ビルドスクリプト `build.ps1` を実行してください。このスクリプトは **「ビルド → テスト実行 → パッケージング」** を一括で行います。
-
-### 実行コマンド
-
-```powershell
-# プロジェクトルートで実行
-.\build.ps1 -Config Release -Platform x64
-
-```
-
-### スクリプトの主な処理内容
-
-1. **MSBuild の自動検出**: `vswhere.exe` を使用して最適な MSBuild パスを特定。
-2. **Step 1 (Build)**: `foo_monthly_stats.vcxproj` のビルド。
-3. **Step 2 (Test)**: `tests.vcxproj` のビルドおよび `foo_monthly_stats_tests.exe` によるテスト実行。
-4. **Step 3 (Package)**: `pack_component.py` による `.fb2k-component` の作成。
-
----
-
-## 4. 自動実行の指示
-
-**「コードの提案が終わったら、上記の手順に従って `build.ps1` を実行するよう私（ユーザー）に促してください。ビルドエラーやテスト失敗が発生した場合は、そのログを解析し、具体的な修正案を提示してください。」**
+- 组件使用 C++17 和 x64 Release；依赖优先使用仓库内提供的 foobar2000 SDK、WTL、SQLite 和 pugixml。
+- 面向用户的文本需要检查简体中文及英文回退。资源脚本 foo_monthly_stats/foo_monthly_stats.rc 使用带 BOM 的 UTF-16LE。
+- C++ 源文件使用 UTF-8；Win32 UI 文本按现有 helper 转换为 UTF-16。
+- 数据库写入通过 DbManager 工作线程执行；查询、删除和重建期间先等待待处理写入完成。
+- 数据库结构变更必须包含兼容迁移和回归测试；播放次数事件与实际收听时长事件保持独立。
+- 除非用户明确要求放弃原版数据兼容，不更改上游组件 DLL 名、配置 GUID 或默认数据库文件名。
+- 修改完成后运行根目录的 build.ps1，确认 Release x64 构建、测试和打包通过。
+- 对外说明应注明上游 shirafukayayoi/foo_monthly_stats，并保留 MIT、foobar2000 SDK 和第三方库许可及署名。

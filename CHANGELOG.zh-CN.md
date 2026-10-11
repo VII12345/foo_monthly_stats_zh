@@ -2,7 +2,7 @@
 
 本文件只记录本仓库相对于上游的本地化和功能改动。上游项目的完整历史请查看 https://github.com/shirafukayayoi/foo_monthly_stats/blob/main/CHANGELOG.md 。
 
-## 尚未发行
+## v1.7.0 - 2026-10-11
 
 - 增加简体中文组件界面、设置页、菜单项和导出报告文案。
 - 统计每首歌曲的实际收听时长；暂停和 seek 跳过的区间不累计。

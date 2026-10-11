@@ -24,7 +24,7 @@ namespace
 
 DECLARE_COMPONENT_VERSION_COPY(
     fms::tr("Monthly Stats", "月度统计"),
-    "1.4.0",
+    "1.7.0",
     getComponentAbout());
 
 VALIDATE_COMPONENT_FILENAME("foo_monthly_stats.dll");
